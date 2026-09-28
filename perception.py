@@ -19,16 +19,8 @@ def gstreamer_pipeline(
 
 
 class Perception:
+
     def __init__(self, calib_file="stereo_params.npz"):
-        self.kernel_open = np.ones((3, 3), np.uint8)
-        self.kernel_close = np.ones((5, 5), np.uint8)
-        # 垂直判定用（少し太くしてノイズを弾く）
-        self.kernel_vertical = np.ones((12, 2), np.uint8)
-
-        # --- 時系列フィルタ用パラメータ ---
-        self.prev_hsv = None
-        self.alpha = 0.15
-
         try:
             calib = np.load(calib_file)
             self.map1_l = calib["map1_l"]
@@ -42,12 +34,13 @@ class Perception:
             )
             self.map1_l = self.map2_l = self.map1_r = self.map2_r = None
 
+        self.num_disparities = 16 * 5  # 80px (探索幅)
         self.stereo_matcher = cv2.StereoSGBM_create(
             minDisparity=0,
-            numDisparities=16 * 5,
-            blockSize=5,
-            P1=8 * 3 * 5**2,
-            P2=32 * 3 * 5**2,
+            numDisparities=self.num_disparities,
+            blockSize=7,
+            P1=8 * 3 * 7**2,
+            P2=32 * 3 * 7**2,
             disp12MaxDiff=1,
             uniquenessRatio=10,
             speckleWindowSize=100,
@@ -73,166 +66,102 @@ class Perception:
             / 16.0
         )
 
-        # 認識領域（上部20%〜85%）
-        roi_top, roi_bottom = int(h * 0.20), int(h * 0.85)
-        roi = rect_l[roi_top:roi_bottom, :]
+        # 左右均等クロップ処理 (両端 80px カット)
+        crop_x = self.num_disparities
+        crop_w = w - (crop_x * 2)
+
+        disparity_crop = disparity[:, crop_x : w - crop_x]
+        rect_l_crop = rect_l[:, crop_x : w - crop_x]
+
+        # 視差マップのカラー化（デバッグ用）
+        disp_valid = np.maximum(0, disparity_crop)
+        disp_norm = cv2.normalize(
+            disp_valid,
+            None,
+            alpha=0,
+            beta=255,
+            norm_type=cv2.NORM_MINMAX,
+            dtype=cv2.CV_8U,
+        )
+        disp_color = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
+
+        # 処理用リサイズ (320x180相当)
         proc_w = 320
-        scale = proc_w / w
-        proc_h = int(roi.shape[0] * scale)
+        scale = proc_w / crop_w
+        proc_h = int(h * scale)
 
         small_roi = cv2.resize(
-            roi, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST
+            rect_l_crop, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST
         )
         small_disp = cv2.resize(
-            disparity[roi_top:roi_bottom, :],
+            disparity_crop,
             (proc_w, proc_h),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        hsv_roi = cv2.cvtColor(small_roi, cv2.COLOR_BGR2HSV)
-
-        # ==========================================================
-        # ★ 1. 安全な「超足元中央」からのステレオシード抽出 ★
-        # ==========================================================
-        # 人の脚などが入りにくい「真下の中央20%」だけを厳選
-        sample_y_start = int(proc_h * 0.82)
-        sample_x_start = int(proc_w * 0.40)
-        sample_x_end = int(proc_w * 0.60)
-
-        stereo_seed = np.zeros((proc_h, proc_w), dtype=np.uint8)
-
-        base_patch = small_disp[
-            sample_y_start:proc_h, sample_x_start:sample_x_end
-        ]
-        valid_disp = base_patch[base_patch > 0]
-        base_median_disp = (
-            np.median(valid_disp) if len(valid_disp) > 5 else 15.0
-        )
-
-        for y in range(sample_y_start, proc_h):
-            factor = (proc_h - y) / float(proc_h - sample_y_start + 1e-5)
-            min_d = max(1.0, base_median_disp * (factor * 0.4 + 0.6))
-            max_d = base_median_disp * 1.3 + 4.0
-            row_disp = small_disp[y, :]
-            stereo_seed[y, (row_disp >= min_d) & (row_disp <= max_d)] = 255
-
-        cv2.morphologyEx(
-            stereo_seed, cv2.MORPH_OPEN, self.kernel_open, dst=stereo_seed
+            interpolation=cv2.INTER_NEAREST,
         )
 
         # ==========================================================
-        # ★ 2. カラーモデル学習（許容幅の厳格な上限キャップ付き） ★
+        # ★ 3D幾何学（高さ比率）による床/障害物判定 ★
         # ==========================================================
-        seed_pixels = hsv_roi[stereo_seed > 0]
+        # 1. 視差マップのノイズ除去
+        disp_smooth = cv2.GaussianBlur(small_disp, (9, 9), 0)
 
-        if len(seed_pixels) > 30:
-            mean_hsv = np.mean(seed_pixels, axis=0)
-            std_hsv = np.std(seed_pixels, axis=0)
+        # 2. 画像の各Y座標（v）グリッド生成
+        v_grid = np.arange(proc_h, dtype=np.float32).reshape(-1, 1)
+        v_grid = np.repeat(v_grid, proc_w, axis=1)
 
-            # 許容幅が広がりすぎないように「絶対上限（min/max）」をかける
-            tol_h = min(12, max(6, int(std_hsv[0] * 1.5)))
-            tol_s = min(30, max(15, int(std_hsv[1] * 1.8)))
-            tol_v = min(30, max(20, int(std_hsv[2] * 1.8)))
+        # 3. 画面の消失点 Y0 (カメラの仰俯角に合わせて微調整可能, 画面上部〜中央)
+        v0 = proc_h * 0.35
 
-            curr_hsv = mean_hsv
-        else:
-            curr_hsv = (
-                self.prev_hsv
-                if self.prev_hsv is not None
-                else np.array([0, 0, 100], dtype=np.float32)
-            )
-            tol_h, tol_s, tol_v = 10, 25, 25
+        # 4. 幾何学的な高さ比率 H_ratio = (v - v0) / max(d, 1.0)
+        valid_disp = np.maximum(disp_smooth, 1.0)
+        height_ratio = (v_grid - v0) / valid_disp
 
-        if self.prev_hsv is None:
-            self.prev_hsv = curr_hsv
-        else:
-            self.prev_hsv = (
-                self.alpha * curr_hsv + (1.0 - self.alpha) * self.prev_hsv
-            )
+        # 5. ベッド/床面の閾値判定
+        # 平らな床/ベッド面では height_ratio が高くなり、突起物/壁では低くなります
+        ground_threshold = 2.2  # ベッド面の高さ比率基準
 
-        mean_h, mean_s, mean_v = self.prev_hsv
+        # 6. シグモイド関数で「赤（障害物:0.0）」と「緑（床:1.0）」に綺麗に二分化
+        diff = height_ratio - ground_threshold
+        raw_score = 1.0 / (1.0 + np.exp(-diff * 2.5))
 
-        lower_bound = np.array(
-            [
-                max(0, int(mean_h - tol_h)),
-                max(0, int(mean_s - tol_s)),
-                max(0, int(mean_v - tol_v)),
-            ],
-            dtype=np.uint8,
+        # 7. モルフォロジー処理で微小なモザイクノイズを除去
+        score_u8 = (raw_score * 255).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        score_u8 = cv2.morphologyEx(score_u8, cv2.MORPH_OPEN, kernel)
+        score_u8 = cv2.morphologyEx(score_u8, cv2.MORPH_CLOSE, kernel)
+
+        clean_score = score_u8.astype(np.float32) / 255.0
+
+        # ==========================================================
+        # ★ HSVグラデーション作成 ★
+        # ==========================================================
+        # H: 60(緑: ベッド面) -> 0(赤: ダンボール/壁/障害物)
+        hue = (clean_score * 60.0).astype(np.uint8)
+        sat = np.full_like(hue, 255)
+        val = np.full_like(hue, 255)
+
+        hsv_map = cv2.merge([hue, sat, val])
+        grad_bgr = cv2.cvtColor(hsv_map, cv2.COLOR_HSV2BGR)
+
+        # 有効視差領域の重ね合わせ（視差 2.0 以上のみ表示）
+        valid_mask = (small_disp > 2.0).astype(np.uint8) * 255
+        mask_bool = valid_mask > 0
+
+        overlay = small_roi.copy()
+        overlay[mask_bool] = cv2.addWeighted(
+            small_roi[mask_bool], 0.35, grad_bgr[mask_bool], 0.65, 0
         )
 
-        upper_bound = np.array(
-            [
-                min(180, int(mean_h + tol_h)),
-                min(255, int(mean_s + tol_s)),
-                min(255, int(mean_v + tol_v)),
-            ],
-            dtype=np.uint8,
+        full_overlay = cv2.resize(
+            overlay, (w, h), interpolation=cv2.INTER_NEAREST
         )
 
-        mask_color = cv2.inRange(hsv_roi, lower_bound, upper_bound)
-
         # ==========================================================
-        # ★ 3. 連結成分抽出（暴走ガード付き） ★
+        # ★ 評価値（左右バイアス） ★
         # ==========================================================
-        # ステレオシードがない場合は強引に広げない
-        if np.sum(stereo_seed) > 0:
-            mask_combined = cv2.bitwise_or(mask_color, stereo_seed)
-            cv2.morphologyEx(
-                mask_combined,
-                cv2.MORPH_CLOSE,
-                self.kernel_close,
-                dst=mask_combined,
-            )
-
-            num_labels, labels, stats, centroids = (
-                cv2.connectedComponentsWithStats(mask_combined)
-            )
-            mask_ground = np.zeros((proc_h, proc_w), dtype=np.uint8)
-
-            seed_labels = np.unique(labels[stereo_seed > 0])
-            for label in seed_labels:
-                if label == 0:
-                    continue
-                mask_ground[labels == label] = 255
-        else:
-            mask_ground = stereo_seed.copy()
-
-        # ==========================================================
-        # ★ 4. 垂直連続視差（車・壁など）のノイズ抑制付き検出 ★
-        # ==========================================================
-        # メディアンフィルタでノイズ成分を強力カット
-        disp_clean = cv2.medianBlur(small_disp.astype(np.float32), 5)
-        sobely_disp = cv2.Sobel(disp_clean, cv2.CV_32F, 0, 1, ksize=3)
-
-        # 一定以上の強い視差（＝近い物体）かつ垂直面である場合のみ
-        vertical_surface = (
-            (disp_clean > 10.0) & (np.abs(sobely_disp) < 0.25)
-        ).astype(np.uint8) * 255
-
-        # 縦長カーネルでノイズを排除
-        wall_disp_mask = cv2.morphologyEx(
-            vertical_surface, cv2.MORPH_OPEN, self.kernel_vertical
-        )
-
-        # Cannyエッジの閾値を上げてノイズでの誤反応を防止 (120, 220)
-        edges = cv2.Canny(cv2.GaussianBlur(small_roi, (5, 5), 0), 120, 220)
-        edges[int(proc_h * 0.80) :, :] = 0  # 足元は除外
-
-        # 壁マスク合成
-        wall_mask = cv2.bitwise_or(
-            wall_disp_mask, cv2.dilate(edges, np.ones((3, 3), np.uint8))
-        )
-
-        # 床優先で壁から削る
-        wall_mask = cv2.bitwise_and(wall_mask, cv2.bitwise_not(mask_ground))
-
-        # ==========================================================
-        # ★ 5. 壁の評価（バイアス・ヨー角） ★
-        # ==========================================================
-        disp_roi = disparity[roi_top:roi_bottom, :]
-        h_d, w_d = disp_roi.shape
-        left_area = disp_roi[:, : int(w_d * 0.35)]
-        right_area = disp_roi[:, int(w_d * 0.65) :]
+        h_d, w_d = disparity_crop.shape
+        left_area = disparity_crop[:, : int(w_d * 0.35)]
+        right_area = disparity_crop[:, int(w_d * 0.65) :]
 
         left_cont = np.sum((left_area > 5.0) & (left_area < 60.0)) / (
             h_d * w_d * 0.35 + 1e-5
@@ -255,35 +184,10 @@ class Perception:
         if np.isnan(wall_yaw_error):
             wall_yaw_error = 0.0
 
-        # デバッグ描画
-        overlay = small_roi.copy()
-        # 床（緑）
-        overlay[mask_ground > 0] = (
-            overlay[mask_ground > 0] * 0.5
-            + np.array([0, 255, 0], dtype=np.uint8) * 0.5
-        )
-        # 車・壁（赤）
-        overlay[wall_mask > 0] = (
-            overlay[wall_mask > 0] * 0.5
-            + np.array([0, 0, 255], dtype=np.uint8) * 0.5
-        )
-        # 確定シード（シアン）
-        overlay[stereo_seed > 0] = (
-            overlay[stereo_seed > 0] * 0.2
-            + np.array([255, 255, 0], dtype=np.uint8) * 0.8
-        )
-
-        full_overlay = cv2.resize(
-            overlay, (w, roi.shape[0]), interpolation=cv2.INTER_NEAREST
-        )
-
         perception_data = {
             "rect_l": rect_l,
-            "mask_ground": mask_ground,
-            "wall_mask": wall_mask,
-            "scale": scale,
-            "roi_top": roi_top,
-            "roi_bottom": roi_bottom,
+            "rect_r": rect_r,
+            "disp_color": disp_color,
             "stereo_bias": stereo_bias,
             "wall_yaw_error": wall_yaw_error,
             "full_overlay": full_overlay,
@@ -299,6 +203,8 @@ if __name__ == "__main__":
     perc = Perception()
     print("認識部のデバッグを開始します（'q'で終了）")
 
+    panel_w, panel_h = 640, 360
+
     while True:
         ret_l, frame_l = cap_l.read()
         ret_r, frame_r = cap_r.read()
@@ -307,26 +213,61 @@ if __name__ == "__main__":
 
         data = perc.process(frame_l, frame_r)
 
-        disp = data["rect_l"].copy()
-        alpha = 0.4
-        disp[data["roi_top"] : data["roi_bottom"], :] = cv2.addWeighted(
-            disp[data["roi_top"] : data["roi_bottom"], :],
-            1 - alpha,
-            data["full_overlay"],
-            alpha,
-            0,
-        )
-
+        # 1. 左カメラ映像 (左上)
+        img_left = cv2.resize(data["rect_l"], (panel_w, panel_h))
         cv2.putText(
-            disp,
-            f"Bias: {data['stereo_bias']:.2f} YawErr: {data['wall_yaw_error']:.2f}",
-            (20, 40),
+            img_left,
+            "Left Camera",
+            (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.8,
             (0, 255, 0),
             2,
         )
-        cv2.imshow("Perception Debug", cv2.resize(disp, (640, 360)))
+
+        # 2. 右カメラ映像 (右上)
+        img_right = cv2.resize(data["rect_r"], (panel_w, panel_h))
+        cv2.putText(
+            img_right,
+            "Right Camera",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
+
+        # 3. 視差マップ / 深度 (左下)
+        img_disp = cv2.resize(data["disp_color"], (panel_w, panel_h))
+        cv2.putText(
+            img_disp,
+            "Disparity Map (Depth)",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+
+        # 4. 認識オーバーレイ結果 (右下)
+        result_img = data["full_overlay"]
+        img_result = cv2.resize(result_img, (panel_w, panel_h))
+        cv2.putText(
+            img_result,
+            f"Bias: {data['stereo_bias']:.2f} YawErr: {data['wall_yaw_error']:.2f}",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+
+        # 2x2 グリッド合成
+        top_row = np.hstack((img_left, img_right))
+        bottom_row = np.hstack((img_disp, img_result))
+        grid_view = np.vstack((top_row, bottom_row))
+
+        cv2.imshow("Perception Multi-Debug", grid_view)
 
         if cv2.waitKey(1) == ord("q"):
             break
