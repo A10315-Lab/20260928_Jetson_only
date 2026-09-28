@@ -34,7 +34,7 @@ class Perception:
             )
             self.map1_l = self.map2_l = self.map1_r = self.map2_r = None
 
-        self.num_disparities = 16 * 5  # 80px (探索幅)
+        self.num_disparities = 16 * 5
         self.stereo_matcher = cv2.StereoSGBM_create(
             minDisparity=0,
             numDisparities=self.num_disparities,
@@ -66,14 +66,13 @@ class Perception:
             / 16.0
         )
 
-        # 左右均等クロップ処理 (両端 80px カット)
         crop_x = self.num_disparities
         crop_w = w - (crop_x * 2)
 
         disparity_crop = disparity[:, crop_x : w - crop_x]
         rect_l_crop = rect_l[:, crop_x : w - crop_x]
 
-        # 視差マップのカラー化（デバッグ用）
+        # 視差カラーマップ
         disp_valid = np.maximum(0, disparity_crop)
         disp_norm = cv2.normalize(
             disp_valid,
@@ -85,7 +84,7 @@ class Perception:
         )
         disp_color = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
 
-        # 処理用リサイズ (320x180相当)
+        # 処理用リサイズ (320x180)
         proc_w = 320
         scale = proc_w / crop_w
         proc_h = int(h * scale)
@@ -99,51 +98,32 @@ class Perception:
             interpolation=cv2.INTER_NEAREST,
         )
 
-        # ==========================================================
-        # ★ 3D幾何学（高さ比率）による床/障害物判定 ★
-        # ==========================================================
-        # 1. 視差マップのノイズ除去
+        # 1. 3D高さ比率による床/障害物判定
         disp_smooth = cv2.GaussianBlur(small_disp, (9, 9), 0)
-
-        # 2. 画像の各Y座標（v）グリッド生成
         v_grid = np.arange(proc_h, dtype=np.float32).reshape(-1, 1)
         v_grid = np.repeat(v_grid, proc_w, axis=1)
 
-        # 3. 画面の消失点 Y0 (カメラの仰俯角に合わせて微調整可能, 画面上部〜中央)
-        v0 = proc_h * 0.35
-
-        # 4. 幾何学的な高さ比率 H_ratio = (v - v0) / max(d, 1.0)
+        v0 = proc_h * 0.35  # 消失点Y
         valid_disp = np.maximum(disp_smooth, 1.0)
         height_ratio = (v_grid - v0) / valid_disp
 
-        # 5. ベッド/床面の閾値判定
-        # 平らな床/ベッド面では height_ratio が高くなり、突起物/壁では低くなります
-        ground_threshold = 2.2  # ベッド面の高さ比率基準
-
-        # 6. シグモイド関数で「赤（障害物:0.0）」と「緑（床:1.0）」に綺麗に二分化
+        ground_threshold = 2.2
         diff = height_ratio - ground_threshold
         raw_score = 1.0 / (1.0 + np.exp(-diff * 2.5))
 
-        # 7. モルフォロジー処理で微小なモザイクノイズを除去
         score_u8 = (raw_score * 255).astype(np.uint8)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         score_u8 = cv2.morphologyEx(score_u8, cv2.MORPH_OPEN, kernel)
         score_u8 = cv2.morphologyEx(score_u8, cv2.MORPH_CLOSE, kernel)
-
         clean_score = score_u8.astype(np.float32) / 255.0
 
-        # ==========================================================
-        # ★ HSVグラデーション作成 ★
-        # ==========================================================
-        # H: 60(緑: ベッド面) -> 0(赤: ダンボール/壁/障害物)
-        hue = (clean_score * 60.0).astype(np.uint8)
+        # 2. カメラ画像オーバーレイ作成
+        hue = (clean_score * 60.0).astype(np.uint8)  # 60:緑, 0:赤
         sat = np.full_like(hue, 255)
         val = np.full_like(hue, 255)
-
         hsv_map = cv2.merge([hue, sat, val])
         grad_bgr = cv2.cvtColor(hsv_map, cv2.COLOR_HSV2BGR)
 
-        # 有効視差領域の重ね合わせ（視差 2.0 以上のみ表示）
         valid_mask = (small_disp > 2.0).astype(np.uint8) * 255
         mask_bool = valid_mask > 0
 
@@ -151,14 +131,74 @@ class Perception:
         overlay[mask_bool] = cv2.addWeighted(
             small_roi[mask_bool], 0.35, grad_bgr[mask_bool], 0.65, 0
         )
-
         full_overlay = cv2.resize(
             overlay, (w, h), interpolation=cv2.INTER_NEAREST
         )
 
         # ==========================================================
-        # ★ 評価値（左右バイアス） ★
+        # ★ 3. 縦長 鳥瞰図（Bird's-Eye View / BEV）マップの生成 ★
         # ==========================================================
+        bev_w, bev_h = 360, 640  # 縦長マップ解像度
+        bev_map = np.zeros((bev_h, bev_w, 3), dtype=np.uint8)
+
+        # 有効な視差を持つピクセルを抽出
+        valid_pts = small_disp > 2.0
+        u_coords, _ = np.meshgrid(
+            np.arange(proc_w), np.arange(proc_h)
+        )
+
+        u_val = u_coords[valid_pts]
+        d_val = small_disp[valid_pts]
+        s_val = clean_score[valid_pts]
+
+        u0 = proc_w / 2.0  # 画像の中心X座標
+
+        # 3D空間への座標変換 (縦長用に奥行きの解像度・レンジを拡張)
+        z_3d = 5000.0 / d_val
+        x_3d = (u_val - u0) * (z_3d / 180.0)
+
+        # BEVマップのピクセル座標へ変換 (最下部中央がロボット位置)
+        bev_x = (bev_w // 2 + x_3d).astype(np.int32)
+        bev_z = (bev_h - 20 - z_3d).astype(np.int32)
+
+        # マップ範囲内の点のみ描画
+        in_bounds = (
+            (bev_x >= 0) & (bev_x < bev_w) & (bev_z >= 0) & (bev_z < bev_h)
+        )
+
+        bev_x = bev_x[in_bounds]
+        bev_z = bev_z[in_bounds]
+        s_val = s_val[in_bounds]
+
+        # 点群のプロット (緑: 床 / 赤: 障害物)
+        for x, z, score in zip(bev_x, bev_z, s_val):
+            color = (0, int(score * 255), int((1.0 - score) * 255))
+            cv2.circle(bev_map, (x, z), 2, color, -1)
+
+        # ロボット自機（最下部中央）の位置を描画 (青色三角形)
+        bot_pos = (bev_w // 2, bev_h - 15)
+        pts = np.array(
+            [
+                [bot_pos[0], bot_pos[1] - 15],
+                [bot_pos[0] - 12, bot_pos[1] + 10],
+                [bot_pos[0] + 12, bot_pos[1] + 10],
+            ],
+            np.int32,
+        )
+        cv2.drawContours(bev_map, [pts], 0, (255, 200, 0), -1)
+
+        # 距離グリッド線の描画 (約1mごとの目安ライン)
+        for r in range(60, bev_h - 20, 80):
+            cv2.line(
+                bev_map,
+                (0, bev_h - 20 - r),
+                (bev_w, bev_h - 20 - r),
+                (50, 50, 50),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # 評価値計算
         h_d, w_d = disparity_crop.shape
         left_area = disparity_crop[:, : int(w_d * 0.35)]
         right_area = disparity_crop[:, int(w_d * 0.65) :]
@@ -191,6 +231,7 @@ class Perception:
             "stereo_bias": stereo_bias,
             "wall_yaw_error": wall_yaw_error,
             "full_overlay": full_overlay,
+            "bev_map": bev_map,
             "proc_h": proc_h,
             "proc_w": proc_w,
         }
@@ -203,7 +244,10 @@ if __name__ == "__main__":
     perc = Perception()
     print("認識部のデバッグを開始します（'q'で終了）")
 
-    panel_w, panel_h = 640, 360
+    # 左側2x2パネルのサイズ設定 (画面全体に収まるサイズ)
+    panel_w, panel_h = 480, 270
+    bev_w = 380  # 右側縦長BEVパネルの幅
+    total_h = panel_h * 2  # 左側2画面分の高さ (540px)
 
     while True:
         ret_l, frame_l = cap_l.read()
@@ -220,7 +264,7 @@ if __name__ == "__main__":
             "Left Camera",
             (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.7,
             (0, 255, 0),
             2,
         )
@@ -232,7 +276,7 @@ if __name__ == "__main__":
             "Right Camera",
             (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.7,
             (0, 255, 0),
             2,
         )
@@ -244,7 +288,7 @@ if __name__ == "__main__":
             "Disparity Map (Depth)",
             (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.7,
             (255, 255, 255),
             2,
         )
@@ -257,17 +301,31 @@ if __name__ == "__main__":
             f"Bias: {data['stereo_bias']:.2f} YawErr: {data['wall_yaw_error']:.2f}",
             (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.6,
             (0, 255, 0),
             2,
         )
 
-        # 2x2 グリッド合成
+        # 5. 鳥瞰図（Bird's-Eye View / 右側に縦長配置）
+        img_bev = cv2.resize(data["bev_map"], (bev_w, total_h))
+        cv2.putText(
+            img_bev,
+            "Bird's-Eye View (Top-Down)",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+        )
+
+        # 画面の結合 (左側2x2 + 右側縦長1画面)
         top_row = np.hstack((img_left, img_right))
         bottom_row = np.hstack((img_disp, img_result))
-        grid_view = np.vstack((top_row, bottom_row))
+        left_grid = np.vstack((top_row, bottom_row))
 
-        cv2.imshow("Perception Multi-Debug", grid_view)
+        full_window = np.hstack((left_grid, img_bev))
+
+        cv2.imshow("Perception Multi-Debug", full_window)
 
         if cv2.waitKey(1) == ord("q"):
             break
