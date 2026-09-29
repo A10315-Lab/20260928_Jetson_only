@@ -1,0 +1,27 @@
+{
+    "name": "Jetson Orin Nano (JetPack 6 - GPU)",
+    "image": "nvcr.io/nvidia/l4t-ml:r36.2.0-py3",
+    "runArgs": [
+        "--runtime=nvidia",
+        "--network=host",
+        "-v", "/tmp/argus_socket:/tmp/argus_socket",
+        "-v", "/tmp/.X11-unix:/tmp/.X11-unix",
+        "-e", "DISPLAY=${env:DISPLAY}",
+        "--device", "/dev/video0",
+        "--device", "/dev/video1"
+    ],
+    "containerEnv": {
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "MALLOC_CHECK_": "0"
+    },
+    "postCreateCommand": "apt-get update && apt-get install -y libegl1",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance"
+            ]
+        }
+    }
+}

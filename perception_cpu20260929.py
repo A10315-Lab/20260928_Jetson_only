@@ -24,88 +24,71 @@ class Perception:
     def __init__(
         self,
         calib_file="stereo_params.npz",
-        bev_scale=1500.0,
+        bev_scale=2000.0,
         ground_threshold=1.3,
     ):
-        self.bev_scale = bev_scale
-        self.ground_threshold = ground_threshold
-        self.num_disparities = 64
-        block_size = 15
-
-        # 1. GPU版 ステレオマッチング器の初期化
-        try:
-            self.stereo_gpu = cv2.cuda.createStereoBM(
-                numDisparities=self.num_disparities, blockSize=block_size
-            )
-        except Exception as e:
-            print(f"CUDA StereoBM 作成エラー: {e}")
-            self.stereo_gpu = None
-
-        # 2. キャリブレーションマップの読み込みとGPUへのアップロード
-        self.gpu_map1_l = cv2.cuda_GpuMat()
-        self.gpu_map2_l = cv2.cuda_GpuMat()
-        self.gpu_map1_r = cv2.cuda_GpuMat()
-        self.gpu_map2_r = cv2.cuda_GpuMat()
-        self.has_calibration = False
-
         try:
             calib = np.load(calib_file)
-            map1_l = calib["map1_l"]
-            map2_l = calib["map2_l"]
-            map1_r = calib["map1_r"]
-            map2_r = calib["map2_r"]
-
-            # GPUメモリへマップデータを一括転送
-            self.gpu_map1_l.upload(map1_l)
-            self.gpu_map2_l.upload(map2_l)
-            self.gpu_map1_r.upload(map1_r)
-            self.gpu_map2_r.upload(map2_r)
-            self.has_calibration = True
-            print("Perception: GPUへのキャリブレーションマップ転送成功。")
+            self.map1_l = calib["map1_l"]
+            self.map2_l = calib["map2_l"]
+            self.map1_r = calib["map1_r"]
+            self.map2_r = calib["map2_r"]
+            print("Perception: キャリブレーションファイルの読み込みに成功しました。")
         except Exception as e:
-            print(f"Perception 警告: 補正なし（またはマップ読み込み失敗）で実行します -> {e}")
+            print(f"Perception 警告: 補正なしで実行します -> {e}")
+            self.map1_l = self.map2_l = self.map1_r = self.map2_r = None
 
-        # GPUメモリ確保用オブジェクトの準備
-        self.gpu_frame_l = cv2.cuda_GpuMat()
-        self.gpu_frame_r = cv2.cuda_GpuMat()
+        self.bev_scale = bev_scale
+        self.ground_threshold = ground_threshold
+
+        # 処理解像度を落としたため、視差数もそれに合わせて調整
+        self.num_disparities = 16 * 4  # 64
+        block_size = 7
+
+        self.stereo_matcher = cv2.StereoSGBM_create(
+            minDisparity=0,
+            numDisparities=self.num_disparities,
+            blockSize=block_size,
+            P1=8 * 3 * block_size**2,
+            P2=32 * 3 * block_size**2,
+            disp12MaxDiff=1,
+            uniquenessRatio=10,
+            speckleWindowSize=50,
+            speckleRange=16,
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+        )
 
     def process(self, frame_l, frame_r):
-        # 1. 画像データをGPUへ転送 (CPU -> GPU)
-        self.gpu_frame_l.upload(frame_l)
-        self.gpu_frame_r.upload(frame_r)
-
-        # 2. GPU上で歪み補正・立体視補正 (Remap)
-        if self.has_calibration:
-            gpu_rect_l = cv2.cuda.remap(
-                self.gpu_frame_l,
-                self.gpu_map1_l,
-                self.gpu_map2_l,
-                cv2.INTER_LINEAR,
+        # 1. 元の解像度のまま正確にキャリブレーション（歪み補正・立体視補正）を適用
+        if self.map1_l is not None:
+            rect_l_orig = cv2.remap(
+                frame_l, self.map1_l, self.map2_l, cv2.INTER_LINEAR
             )
-            gpu_rect_r = cv2.cuda.remap(
-                self.gpu_frame_r,
-                self.gpu_map1_r,
-                self.gpu_map2_r,
-                cv2.INTER_LINEAR,
+            rect_r_orig = cv2.remap(
+                frame_r, self.map1_r, self.map2_r, cv2.INTER_LINEAR
             )
         else:
-            gpu_rect_l, gpu_rect_r = self.gpu_frame_l, self.gpu_frame_r
+            rect_l_orig, rect_r_orig = frame_l, frame_r
 
-        # 3. GPU上でグレースケール変換
-        gpu_gray_l = cv2.cuda.cvtColor(gpu_rect_l, cv2.COLOR_BGR2GRAY)
-        gpu_gray_r = cv2.cuda.cvtColor(gpu_rect_r, cv2.COLOR_BGR2GRAY)
+        # 2. 処理負荷を下げるために、ここで初めて画像を1/2に縮小する（例: 1280x720 -> 640x360）
+        scale_ratio = 0.5
+        rect_l = cv2.resize(
+            rect_l_orig, (0, 0), fx=scale_ratio, fy=scale_ratio
+        )
+        rect_r = cv2.resize(
+            rect_r_orig, (0, 0), fx=scale_ratio, fy=scale_ratio
+        )
 
-        # 4. GPU上で高速ステレオマッチング計算
-        gpu_disp = self.stereo_gpu.compute(gpu_gray_l, gpu_gray_r)
-
-        # 5. 後処理のためCPUメモリへ戻す (GPU -> CPU)
-        rect_l = gpu_rect_l.download()
-        rect_r = gpu_rect_r.download()
-        disparity_raw = gpu_disp.download().astype(np.float32)
-        disparity = disparity_raw / 16.0
-
-        # ---- 以降はNumPyでの後処理・BEV描画 ----
         h, w, _ = rect_l.shape
+        gray_l = cv2.cvtColor(rect_l, cv2.COLOR_BGR2GRAY)
+        gray_r = cv2.cvtColor(rect_r, cv2.COLOR_BGR2GRAY)
+
+        # 縮小画像でステレオマッチング計算（爆速化）
+        disparity = (
+            self.stereo_matcher.compute(gray_l, gray_r).astype(np.float32)
+            / 16.0
+        )
+
         crop_x = self.num_disparities
         disparity_crop = disparity[:, crop_x : w - crop_x]
         rect_l_crop = rect_l[:, crop_x : w - crop_x]
@@ -117,7 +100,7 @@ class Perception:
         )
         disp_color = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
 
-        # 床/障害物判定
+        # 床・障害物判定
         v0 = h_c * 0.20
         v_grid = np.arange(h_c, dtype=np.float32).reshape(-1, 1)
         v_grid = np.repeat(v_grid, w_c, axis=1)
@@ -130,14 +113,20 @@ class Perception:
         raw_score[v_grid <= v0] = 0.0
         clean_score = (raw_score > 0.40).astype(np.float32)
 
-        # オーバーレイ画像作成
+        # 表示用に元のサイズに戻したオーバーレイを作成
         overlay = rect_l_crop.copy()
         mask_bool = disparity_crop > 0.5
         overlay[mask_bool] = cv2.addWeighted(
-            rect_l_crop[mask_bool], 0.5, disp_color[mask_bool], 0.5, 0
+            rect_l_crop[mask_bool],
+            0.5,
+            disp_color[mask_bool],
+            0.5,
+            0,
         )
         full_overlay = cv2.resize(
-            overlay, (w, h), interpolation=cv2.INTER_NEAREST
+            overlay,
+            (rect_l_orig.shape[1], rect_l_orig.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
         )
 
         # 鳥瞰図（BEV）生成
@@ -177,7 +166,7 @@ class Perception:
         bev_x = bev_x[in_bounds]
         bev_z = bev_z[in_bounds]
 
-        for x, z in zip(bev_x[::3], bev_z[::3]):
+        for x, z in zip(bev_x[::2], bev_z[::2]):
             cv2.circle(bev_map, (x, z), 2, (0, 255, 0), -1)
 
         bot_pos = (bev_w // 2, bev_h - 10)
@@ -191,22 +180,23 @@ class Perception:
         )
         cv2.drawContours(bev_map, [pts], 0, (255, 200, 0), -1)
 
-        return {
-            "rect_l": rect_l,
-            "rect_r": rect_r,
+        perception_data = {
+            "rect_l": rect_l_orig,  # 表示は元の高解像度を維持
+            "rect_r": rect_r_orig,
             "disp_color": disp_color,
             "full_overlay": full_overlay,
             "bev_map": bev_map,
         }
+        return perception_data
 
 
 if __name__ == "__main__":
-    # 1280x720, 50fps でキャプチャ開始
+    # キャプチャは元の1280x720、50fpsで取得
     cap_l = cv2.VideoCapture(gstreamer_pipeline(sensor_id=0), cv2.CAP_GSTREAMER)
     cap_r = cv2.VideoCapture(gstreamer_pipeline(sensor_id=1), cv2.CAP_GSTREAMER)
 
     perc = Perception(bev_scale=1500.0, ground_threshold=1.3)
-    print("GPUアクセラレーション 50fpsテストを開始します")
+    print("高精度・高速化デバッグを開始します")
 
     panel_w, panel_h = 400, 225
     bev_w = 300
@@ -251,7 +241,7 @@ if __name__ == "__main__":
         left_grid = np.vstack((top_row, bottom_row))
         full_window = np.hstack((left_grid, img_bev))
 
-        cv2.imshow("Perception Multi-Debug (GPU)", full_window)
+        cv2.imshow("Perception Multi-Debug", full_window)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
