@@ -1,0 +1,5 @@
+#!/Users/kazuto/Desktop/hibiken/dual_cam/20260928_Jetson_only/env/bin/python3.10
+
+from idlelib.pyshell import main
+if __name__ == '__main__':
+    main()

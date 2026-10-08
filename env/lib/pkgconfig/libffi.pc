@@ -1,0 +1,11 @@
+prefix=/Users/kazuto/Desktop/hibiken/dual_cam/20260928_Jetson_only/env
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+toolexeclibdir=${libdir}
+includedir=/Users/kazuto/Desktop/hibiken/dual_cam/20260928_Jetson_only/env/include
+
+Name: libffi
+Description: Library supporting Foreign Function Interfaces
+Version: 3.4.8
+Libs: -L${toolexeclibdir} -lffi
+Cflags: -I${includedir}
