@@ -1,8 +1,7 @@
 """
-MotorController for Steering Control
-Python 3.10 / Anaconda Compatible
+MotorController (Actuator Driver Only)
+ステアリングおよびスロットル指令 (-1.0 ~ +1.0) を PWM パルス幅に変換して出力する専用モジュール。
 """
-import math
 import time
 
 ADAFRUIT_AVAILABLE = False
@@ -10,122 +9,105 @@ PCA9685 = None
 board = None
 busio = None
 
-# Python 3.10 および PC/Anaconda 環境での安全なインポート
 try:
     import board
     import busio
     from adafruit_pca9685 import PCA9685
     ADAFRUIT_AVAILABLE = True
 except (ImportError, NotImplementedError, Exception) as e:
-    # PC環境やライブラリ未導入環境ではモックモードへ退避
-    print(f"情報: ハードウェアライブラリが無効です ({e})。シミュレーション/モックモードで動作します。")
+    print(f"情報: PCA9685ライブラリ無効 ({e})。シミュレーション/モックモードで動作します。")
     ADAFRUIT_AVAILABLE = False
 
 
 class MotorController:
-    """
-    リスクポテンシャル場（Risk Potential Field）
-    および前方注視ドライバモデルに基づく操舵サーボコントローラ
-    """
-    def __init__(self, channel: int = 0, center: int = 300, 
-                 min_pulse: int = 150, max_pulse: int = 450,
-                 kp: float = 0.35, kc: float = 500.0, 
-                 ks: float = 25.0, kyaw: float = 15.0,
-                 b_safe: float = 0.25, sigma_w: float = 0.15):
+    def __init__(self,
+                 steer_ch: int = 0,
+                 steer_center: int = 300,
+                 steer_range: int = 150,     # center ± range (150 ~ 450)
+                 throttle_ch: int = 1,
+                 throttle_neutral: int = 307, # ESCニュートラル (約1.5ms)
+                 throttle_range: int = 100):  # 前進/後退の最大変化幅
         
-        self.channel = int(channel)
-        self.center = int(center)
-        self.min_pulse = int(min_pulse)
-        self.max_pulse = int(max_pulse)
+        self.steer_ch = steer_ch
+        self.steer_center = steer_center
+        self.steer_min = steer_center - steer_range
+        self.steer_max = steer_center + steer_range
         
-        # --- リスクポテンシャル法パラメータ ---
-        self.k_lane = float(kp)       # 引力ゲイン（中心線追従力）
-        self.k_curv = float(kc)       # 前方注視・カーブ先読みシフト量ゲイン
-        self.k_wall = float(ks)       # 斥力ゲイン（壁面反発力振幅）
-        self.k_yaw = float(kyaw)      # ダンピング項（車体姿勢の蛇行抑制）
-        
-        self.b_safe = float(b_safe)   # 斥力不感帯
-        self.sigma_w = float(sigma_w) # 斥力場の急峻度
+        self.throttle_ch = throttle_ch
+        self.throttle_neutral = throttle_neutral
+        self.throttle_min = throttle_neutral - throttle_range
+        self.throttle_max = throttle_neutral + throttle_range
 
-        # 表示・外部参照用
-        self.kp = kp
-        self.kc = kc
-        self.ks = ks
-        self.kyaw = kyaw
-        
         self.pca = None
         if ADAFRUIT_AVAILABLE and (busio is not None) and (board is not None):
             try:
                 i2c = busio.I2C(board.SCL, board.SDA)
                 self.pca = PCA9685(i2c)
-                self.pca.frequency = 50  
+                self.pca.frequency = 50  # 50Hz (サーボ / ESC 周期: 20ms)
                 time.sleep(0.1)
-                self._set_pwm(self.center)
+                self.stop()
                 print("MotorController: PCA9685 の初期化に成功しました。")
             except Exception as e:
-                print(f"MotorController エラー: PCA9685の初期化に失敗しました -> {e}")
+                print(f"MotorController エラー: PCA9685初期化失敗 -> {e}")
                 self.pca = None
 
-    def _set_pwm(self, pulse: int) -> None:
+    def _set_pwm(self, channel: int, pulse: int) -> None:
+        """12-bit パルス値 (0-4095) を 16-bit デューティサイクルに変換して出力"""
         if self.pca is not None:
-            # 12-bit (0-4095) から 16-bit (0-65535) へのデューティサイクル変換
             duty = int(pulse * 65535 / 4096)
-            self.pca.channels[self.channel].duty_cycle = duty
+            self.pca.channels[channel].duty_cycle = max(0, min(65535, duty))
 
-    def compute_potential_steering(self, offset: float, curvature: float, 
-                                   stereo_bias: float, wall_yaw_error: float):
+    def drive(self, steer: float, throttle: float = 0.0) -> None:
         """
-        ポテンシャル勾配から操舵パルス変化量を算出
+        モータおよびサーボへの出力
+        :param steer: ステアリング指令 (-1.0: 最大左 〜 0.0: センター 〜 +1.0: 最大右)
+        :param throttle: スロットル指令 (-1.0: 最大後退/ブレーキ 〜 0.0: 停止 〜 +1.0: 最大前進)
         """
-        # 1. 引力ポテンシャル勾配 F_att (前方注視モデルによる車線追従)
-        preview_offset = offset + (self.k_curv * curvature)
-        f_att = self.k_lane * preview_offset
+        # 入力を [-1.0, 1.0] に正規化クリッピング
+        steer_clamped = max(-1.0, min(1.0, float(steer)))
+        throttle_clamped = max(-1.0, min(1.0, float(throttle)))
 
-        # 2. 斥力ポテンシャル勾配 F_rep (指数関数型リスク場)
-        f_rep = 0.0
-        abs_bias = abs(stereo_bias)
-        if abs_bias > self.b_safe:
-            # 指数発散防止のために指数部をクリッピング (上限 4.0)
-            exponent = min((abs_bias - self.b_safe) / self.sigma_w, 4.0)
-            rep_mag = self.k_wall * (math.exp(exponent) - 1.0)
-            sign = 1.0 if stereo_bias > 0 else -1.0
-            f_rep = sign * rep_mag
+        # パルス幅へマッピング
+        steer_pulse = int(self.steer_center + steer_clamped * (self.steer_max - self.steer_center))
+        throttle_pulse = int(self.throttle_neutral + throttle_clamped * (self.throttle_max - self.throttle_neutral))
 
-        # 3. ヨー角ダンピング項 F_yaw (蛇行抑制)
-        f_yaw = self.k_yaw * wall_yaw_error
+        # ハードウェアリミット保護
+        steer_pulse = max(self.steer_min, min(self.steer_max, steer_pulse))
+        throttle_pulse = max(self.throttle_min, min(self.throttle_max, throttle_pulse))
 
-        # 4. 合成操舵補正パルス量
-        pulse_change = f_att + f_rep + f_yaw
-        return pulse_change, f_att, f_rep, f_yaw
+        # 実機へ出力
+        self._set_pwm(self.steer_ch, steer_pulse)
+        self._set_pwm(self.throttle_ch, throttle_pulse)
 
-    def drive(self, offset: float, curvature: float, 
-              stereo_bias: float, wall_yaw_error: float) -> None:
-        pulse_change, f_att, f_rep, f_yaw = self.compute_potential_steering(
-            offset, curvature, stereo_bias, wall_yaw_error
-        )
-        
-        target_pulse = int(round(self.center + pulse_change))
-        # ハードウェアリミッター（サーボの可動範囲内に収める）
-        target_pulse = max(self.min_pulse, min(self.max_pulse, target_pulse))
-        
-        self._set_pwm(target_pulse)
-        print(f"\r[Motor] Att:{f_att:+5.1f} | Rep:{f_rep:+5.1f} | Yaw:{f_yaw:+5.1f} | Pulse:{target_pulse:4d}", end="", flush=True)
+        print(f"\r[Actuator] Steer: {steer_clamped:+1.2f} (Pulse:{steer_pulse:3d}) | "
+              f"Throttle: {throttle_clamped:+1.2f} (Pulse:{throttle_pulse:3d})", end="", flush=True)
+
+    def stop(self) -> None:
+        """ステアリングを中立に戻し、スロットルをニュートラルにする"""
+        self._set_pwm(self.steer_ch, self.steer_center)
+        self._set_pwm(self.throttle_ch, self.throttle_neutral)
 
     def cleanup(self) -> None:
-        if self.pca is not None:
-            print("\nステアリングをセンターに復帰しています...")
-            self._set_pwm(self.center)
-            time.sleep(0.2)
+        """終了時の安全停止処理"""
+        print("\nアクチュエータを停止・中立に復帰しています...")
+        self.stop()
+        time.sleep(0.1)
 
 
 if __name__ == "__main__":
-    print("Python 3.10 / Anaconda コンパイルテスト完了")
+    print("MotorController 単体テスト開始 (ドライバ動作確認)")
     motor = MotorController()
     try:
-        motor.drive(offset=-50.0, curvature=0.0, stereo_bias=0.0, wall_yaw_error=0.0)
+        print("\n1. センター & 停止")
+        motor.drive(steer=0.0, throttle=0.0)
         time.sleep(0.5)
-        motor.drive(offset=0.0, curvature=0.0, stereo_bias=0.6, wall_yaw_error=0.0)
+
+        print("\n2. 左にフルステア、微速前進")
+        motor.drive(steer=-1.0, throttle=0.2)
         time.sleep(0.5)
-        motor.drive(offset=0.0, curvature=0.0, stereo_bias=0.0, wall_yaw_error=0.0)
+
+        print("\n3. 右にフルステア、微速前進")
+        motor.drive(steer=1.0, throttle=0.2)
+        time.sleep(0.5)
     finally:
         motor.cleanup()
