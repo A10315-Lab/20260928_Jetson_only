@@ -7,10 +7,10 @@ import time
 import sys
 
 # 各モジュールのインポート
-from perception import Perception, gstreamer_pipeline
-from trajectory_planner import TrajectoryPlanner
-from risk_potential_controller import RiskPotentialController
-from motor_controller import MotorController
+from src.perception import Perception, gstreamer_pipeline
+from src.trajectory_planner import TrajectoryPlanner
+from src.risk_potential_controller import RiskPotentialController
+from src.motor_controller import MotorController
 
 
 def main():
