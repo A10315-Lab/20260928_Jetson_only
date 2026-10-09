@@ -1,0 +1,9 @@
+# 前提
+# anaconda or miniforgeがインストール済み
+
+# 新しい端末側で新しく仮想環境を作成
+conda create -n ./.venv python=3.10 -y
+conda activate ./.venv
+
+# 一覧からその端末向けにビルド・インストール
+pip install -r requirements.txt
